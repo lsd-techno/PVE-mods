@@ -5,16 +5,19 @@
 
 ################### Configuration #############
 
-# Display configuration for HDD, NVME, CPU
+# Display configuration for HDD, NVME, GPU, CPU
 # Set to 0 to disable line breaks
 # Note: use these settings only if the displayed layout is broken
 CPU_ITEMS_PER_ROW=0
 NVME_ITEMS_PER_ROW=0
+GPU_ITEMS_PER_ROW=0
 HDD_ITEMS_PER_ROW=0
 
 # Known CPU sensor names. They can be full or partial but should ensure unambiguous identification.
 # Should new ones be added, also update logic in configure() function.
 KNOWN_CPU_SENSORS=("coretemp-isa-" "k10temp-pci-")
+# Known GPU sensor names.
+KNOWN_GPU_SENSORS=("amdgpu" "radeon" "nouveau" "nvidia")
 
 # Overwrite default backup location
 BACKUP_DIR=""
@@ -195,11 +198,27 @@ function configure {
 	fi
 	#endregion cpu setup
 
+	#### GPU ####
+	#region gpu setup
+	msgb "\n=== Detecting GPU sensors ==="
+	local gpuList=$(echo "$sanitisedSensorsOutput" | grep -o '"\(amdgpu[^\"]*\|radeon[^\"]*\|nouveau[^\"]*\|nvidia[^\"]*\)"' | sed 's/"//g' | sort -u | paste -sd, -)
+	local gpuCount=$(echo "$gpuList" | tr ',' '\n' | grep -cve '^\s*$')
+
+	if [ "$gpuCount" -gt 0 ]; then
+		info "Detected GPU sensors ($gpuCount): $gpuList"
+		ENABLE_GPU_TEMP=true
+		SENSORS_DETECTED=true
+	else
+		warn "No GPU sensors found."
+		ENABLE_GPU_TEMP=false
+	fi
+	#endregion gpu setup
+
 	#### RAM ####
 	#region ram setup
 	msgb "\n=== Detecting RAM temperature sensors ==="
-	local ramList=$(echo "$sanitisedSensorsOutput" | grep -o '"SODIMM[^"]*"' | sed 's/"//g' | paste -sd, -)
-	local ramCount=$(grep -c '"SODIMM[^"]*"' <<<"$sanitisedSensorsOutput")
+	local ramList=$(echo "$sanitisedSensorsOutput" | grep -o '"\(SODIMM[^"]*\|spd[0-9]\+-i2c-[^"]*\)"' | sed 's/"//g' | sort -u | paste -sd, -)
+	local ramCount=$(echo "$sanitisedSensorsOutput" | grep -o '"\(SODIMM[^"]*\|spd[0-9]\+-i2c-[^"]*\)"' | sed 's/"//g' | sort -u | wc -l)
 
 	if [ "$ramCount" -gt 0 ]; then
 		info "Detected RAM sensors ($ramCount): $ramList"
@@ -417,6 +436,7 @@ function install_mod {
 
     generate_and_insert_widget "$ENABLE_FAN_SPEED" "generate_fan_widget" "fan"
     generate_and_insert_widget "$ENABLE_RAM_TEMP" "generate_ram_widget" "ram"
+    generate_and_insert_widget "$ENABLE_GPU_TEMP" "generate_gpu_widget" "gpu"
     generate_and_insert_widget "$ENABLE_CPU" "generate_cpu_widget" "cpu"
 
     #### Visual separation ####
@@ -704,6 +724,8 @@ add_visual_separator() {
         lastItemId="thermalHdd"
     elif [ "$ENABLE_NVME_TEMP" = true ]; then
         lastItemId="thermalNvme"
+    elif [ "$ENABLE_GPU_TEMP" = true ]; then
+        lastItemId="thermalGpu"
     elif [ "$ENABLE_FAN_SPEED" = true ]; then
         lastItemId="speedFan"
     else
@@ -1098,8 +1120,8 @@ generate_nvme_widget() {
 						}
 					} catch(e) { /*_*/ }
 				});
-				const result = temps.map((strTemp, index, arr) => { return strTemp + (index + 1 < arr.length ? ((index + 1) % itemsPerRow === 0 ? '<br>' : '&nbsp;| ') : ''); });
-				return '<div style="text-align: left; margin-left: 28px;">' + (result.length > 0 ? result.join('') : 'N/A') + '</div>';
+				const result = temps.map(strTemp => strTemp);
+				return '<div style="text-align: left; margin-left: 28px;">' + (result.length > 0 ? result.join('<br>') : 'N/A') + '</div>';
 			}
 		},
 EOF
@@ -1107,6 +1129,137 @@ EOF
 	#endregion nvme widget heredoc
     if [[ $? -ne 0 ]]; then
         echo "Error: Failed to generate nvme widget code" >&2
+        exit 1
+    fi
+}
+
+# Function to generate GPU widget
+generate_gpu_widget() {
+    #region gpu widget heredoc
+    # use subshell to allow variable expansion
+    (
+        export HELPERCTORPARAMS
+        export GPU_ITEMS_PER_ROW
+        cat <<'EOF' | envsubst '$HELPERCTORPARAMS $GPU_ITEMS_PER_ROW' > "$1"
+        {
+            itemId: 'thermalGpu',
+            colspan: 2,
+            printBar: false,
+            title: gettext('GPU Thermal State'),
+            iconCls: 'fa fa-fw fa-microchip',
+            textField: 'sensorsOutput',
+            renderer: function(value) {
+                const tempHelper = Ext.create('PVE.mod.TempHelper', $HELPERCTORPARAMS);
+                let objValue;
+                try {
+                    objValue = JSON.parse(value) || {};
+                } catch(e) {
+                    objValue = {};
+                }
+
+                const resolveValue = (node) => {
+                    if (node === null || node === undefined) {
+                        return NaN;
+                    }
+                    if (typeof node === 'number') {
+                        return node;
+                    }
+                    if (typeof node === 'string') {
+                        return parseFloat(node);
+                    }
+                    if (typeof node === 'object') {
+                        if ('input' in node) {
+                            return resolveValue(node.input);
+                        }
+                        if ('value' in node) {
+                            return resolveValue(node.value);
+                        }
+                        for (const key of Object.keys(node)) {
+                            const nested = resolveValue(node[key]);
+                            if (!isNaN(nested)) {
+                                return nested;
+                            }
+                        }
+                    }
+                    return NaN;
+                };
+
+                const formatValue = (sensorKey, rawValue) => {
+                    const value = parseFloat(rawValue);
+                    if (isNaN(value)) {
+                        return { text: String(rawValue), unit: '' };
+                    }
+
+                    const key = String(sensorKey).toLowerCase();
+                    if (/(vdd|volt|vcc|vcore|vram|vin)/.test(key)) {
+                        return { text: Ext.util.Format.number(value, '0.000'), unit: 'V' };
+                    }
+                    if (/(clk|sclk|mclk|fclk|uclk|dclk|gpuclk|memclk|pixelclk|coreclk)/.test(key)) {
+                        const mhz = value > 1000 ? value / 1000000 : value;
+                        return { text: Ext.util.Format.number(mhz, '0.0'), unit: 'MHz' };
+                    }
+                    if (/(ppt|power|watt|tgp|tdp)/.test(key)) {
+                        return { text: Ext.util.Format.number(value, '0.0'), unit: 'W' };
+                    }
+                    if (/(temp|edge|junction|hotspot)/.test(key)) {
+                        return { text: Ext.util.Format.number(tempHelper.getTemp(value), '0.0'), unit: tempHelper.getUnit(), temp: true };
+                    }
+                    return { text: Ext.util.Format.number(value, '0.0'), unit: '' };
+                };
+
+                const colorForTemp = (value) => {
+                    if (value < 50) {
+                        return 'green';
+                    }
+                    if (value < 65) {
+                        return '#FFC300';
+                    }
+                    return 'red';
+                };
+
+                const gpuKeys = Object.keys(objValue).filter(item => /^(amdgpu|radeon|nouveau|nvidia)(?:-pci-)?/.test(String(item))).sort();
+                let lines = [];
+                gpuKeys.forEach((gpuKey) => {
+                    try {
+                        const gpuObj = objValue[gpuKey] || {};
+                        lines.push(`<div style="font-weight: 600; margin-top: 0.5em;">${gpuKey}</div>`);
+                        Object.keys(gpuObj).sort().forEach(sensorKey => {
+                            const sensor = gpuObj[sensorKey];
+                            let sensorValue = NaN;
+                            if (sensor && typeof sensor === 'object') {
+                                if ('input' in sensor) {
+                                    sensorValue = resolveValue(sensor.input);
+                                } else if ('temp1_input' in sensor) {
+                                    sensorValue = resolveValue(sensor.temp1_input);
+                                } else if ('temp1' in sensor) {
+                                    sensorValue = resolveValue(sensor.temp1);
+                                } else {
+                                    sensorValue = resolveValue(sensor);
+                                }
+                            } else {
+                                sensorValue = resolveValue(sensor);
+                            }
+
+                            if (!isNaN(sensorValue)) {
+                                const formatted = formatValue(sensorKey, sensorValue);
+                                const isTemp = formatted.temp === true || /\b(temp|edge|junction|hotspot)\b/.test(String(sensorKey).toLowerCase());
+                                const style = isTemp ? `color: ${colorForTemp(parseFloat(formatted.text))};` : '';
+                                const label = String(sensorKey).replace(/_input$/, '').replace(/_/g, ' ');
+                                const suffix = formatted.unit ? `${formatted.text}${formatted.unit}` : formatted.text;
+                                lines.push(`<div style="margin-left: 12px; ${style}">${label}: ${suffix}</div>`);
+                            }
+                        });
+                    } catch(e) { /*_*/ }
+                });
+
+                return '<div style="text-align: left; margin-left: 28px;">' + (lines.length > 0 ? lines.join('') : 'N/A') + '</div>';
+            }
+        },
+EOF
+    )
+    #endregion gpu widget heredoc
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to generate gpu widget code" >&2
         exit 1
     fi
 }
@@ -1278,7 +1431,7 @@ generate_ram_widget() {
 			iconCls: 'fa fa-fw fa-thermometer-half',
 			textField: 'sensorsOutput',
 			renderer: function(value) {
-				const cpuTempHelper = Ext.create('PVE.mod.TempHelper', $HELPERCTORPARAMS);
+				const tempHelper = Ext.create('PVE.mod.TempHelper', $HELPERCTORPARAMS);
 
 				let objValue;
 				try {
@@ -1287,41 +1440,46 @@ generate_ram_widget() {
 					objValue = {};
 				}
 
-				// Recursive function to find ram keys and values
+				function isRamParentKey(key) {
+					return /SODIMM|spd[0-9]+-i2c/i.test(String(key));
+				}
+
 				function findRamKeys(obj, ramKeys, parentKey = null) {
 					Object.keys(obj).forEach(key => {
-					const value = obj[key];
-					if (typeof value === 'object' && value !== null) {
-						// If the value is an object, recursively call the function
-						findRamKeys(value, ramKeys, key);
-					} else if (/^temp\d+_input$/.test(key) && parentKey && parentKey.startsWith("SODIMM")) {
-						if (value !== 0) {
-							ramKeys.push({ key: parentKey, value: value});
-						}
+						const item = obj[key];
+						const currentParent = parentKey || key;
+						if (typeof item === 'object' && item !== null) {
+							findRamKeys(item, ramKeys, currentParent);
+						} else if (/^temp\d+_input$/.test(key) && parentKey && isRamParentKey(parentKey)) {
+						ramKeys.push({ parent: parentKey, key: key.replace(/_input$/, ''), value: item });
 					}
 					});
 				}
 
-				let ramTemps = [];
-				// Loop through the parent keys
-				Object.keys(objValue).forEach(parentKey => {
-					const parentObj = objValue[parentKey];
-					// Array to store ram keys and values
-					const ramKeys = [];
-					// Call the recursive function to find ram keys and values
-					findRamKeys(parentObj, ramKeys);
-					// Sort the ramKeys keys
-					ramKeys.sort();
-					// Process each ram key and value
-					ramKeys.forEach(({ key: ramKey, value: ramTemp }) => {
-					try {
-						ramTemps.push(`${ramKey}:&nbsp${ramTemp}${cpuTempHelper.getUnit()}`);
-					} catch(e) {
-						console.error(`Error retrieving Ram Temp for ${ramTemps} in ${parentKey}:`, e); // Debug: Log specific error
+				let ramKeys = [];
+				findRamKeys(objValue, ramKeys);
+
+				const grouped = {};
+				ramKeys.forEach(({ parent, key: ramKey, value: ramTemp }) => {
+					if (!grouped[parent]) {
+						grouped[parent] = [];
 					}
-					});
+					grouped[parent].push({ key: ramKey, value: ramTemp });
 				});
-				return '<div style="text-align: left; margin-left: 28px;">' + (ramTemps.length > 0 ? ramTemps.join(' | ') : 'N/A') + '</div>';
+
+				let ramTemps = [];
+				Object.keys(grouped).sort().forEach((parentKey, index) => {
+					const moduleLabel = `RAM ${index + 1}`;
+					const entries = grouped[parentKey]
+						.sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true, sensitivity: 'base' }))
+						.map(({ key: ramKey, value: ramTemp }) => {
+							const tempText = `${Ext.util.Format.number(tempHelper.getTemp(parseFloat(ramTemp)), '0.0')}${tempHelper.getUnit()}`;
+							return ramKey === 'temp1' ? tempText : `${ramKey}: ${tempText}`;
+						});
+					ramTemps.push(`<div style="margin-bottom: 4px;">${moduleLabel}: ${entries.join(', ')}</div>`);
+				});
+
+				return '<div style="text-align: left; margin-left: 28px;">' + (ramTemps.length > 0 ? ramTemps.join('') : 'N/A') + '</div>';
 			}
 		},
 EOF
